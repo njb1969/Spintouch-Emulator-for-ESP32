@@ -311,7 +311,7 @@ script:
     then:
       - lambda: |-
           ESP_LOGI("spintouch_emu", "Run Test pressed (disk=%s, sanitizer=%s)",
-                   id(disk_select).current_option(), id(sanitizer_select).current_option());
+                   id(disk_select).current_option().c_str(), id(sanitizer_select).current_option().c_str());
 
       # Status 0x03 = "Testing in progress" (RESEARCH.md Status Notifications
       # table). Set but deliberately NOT notified: coordinator.py's
