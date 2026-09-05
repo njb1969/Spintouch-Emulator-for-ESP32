@@ -1,0 +1,514 @@
+# =============================================================================
+# SpinTouch BLE Emulator
+# =============================================================================
+# Emulates a LaMotte WaterLink SpinTouch water tester over BLE so the
+# joyfulhouse/lamotte-spintouch Home Assistant integration can be exercised
+# without a physical device.
+#
+# Protocol reproduced from that repo's RESEARCH.md and
+# custom_components/spintouch/const.py + coordinator.py (read 2026-09-05).
+# All UUIDs and byte-structure constants below are copied verbatim from
+# those files, not retyped from memory (Coding 102).
+#
+# Lifecycle this emulates, matching coordinator.py exactly:
+#   1. Advertise the SpinTouch service UUID so HA's bluetooth matcher fires.
+#   2. HA connects, subscribes to notifications on the TESTAVAIL characteristic.
+#   3. On "Run Test" (button), we notify TESTAVAIL = 0x03 (testing), wait a
+#      few seconds to simulate the cuvette read, build the 91-byte TTEST
+#      payload from the current disk/sanitizer/number values + current time,
+#      then notify TESTAVAIL = 0x04 (test complete).
+#   4. HA reads TTEST, parses it, and writes 0x01 to TESTACK to acknowledge.
+#      We log that ACK and reset TESTAVAIL back to 0x02 (ready).
+#   5. HA will disconnect ~10s later and stay away for ~5 minutes
+#      (its own DISCONNECT_DELAY / RECONNECT_DELAY) - that part is entirely
+#      HA-side behaviour, nothing for the emulator to do.
+#
+# Platform note: built as an ESPHome YAML file specifically because it can be
+# compiled and flashed entirely from a Chromebook browser (ESPHome Web /
+# ESPHome Dashboard add-on), with no native toolchain or USB-passthrough
+# Linux container required.
+# =============================================================================
+
+esphome:
+  name: spintouch-emulator
+  friendly_name: SpinTouch Emulator
+  # Randomize every chemical value once per boot. random_float() is backed
+  # by the ESP32's hardware RNG (esp_random()), so this differs on every
+  # boot without needing a seed. Disk series and sanitizer are left as
+  # whatever the user last selected - only the chemical numbers randomize.
+  on_boot:
+    then:
+      - lambda: |-
+          auto rand_range = [](float lo, float hi) -> float {
+            return lo + random_float() * (hi - lo);
+          };
+          id(n_fc).publish_state(rand_range(0, 15));
+          id(n_tc).publish_state(rand_range(0, 15));
+          id(n_br).publish_state(rand_range(0, 33));
+          id(n_ph).publish_state(rand_range(6.0, 9.0));
+          id(n_alk).publish_state(rand_range(0, 250));
+          id(n_ca).publish_state(rand_range(0, 1200));
+          id(n_cya).publish_state(rand_range(0, 300));
+          id(n_cu).publish_state(rand_range(0, 5));
+          id(n_fe).publish_state(rand_range(0, 5));
+          id(n_bor).publish_state(rand_range(0, 100));
+          id(n_phos).publish_state(rand_range(0, 2500));
+          id(n_salt).publish_state(rand_range(0, 10000));
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+
+ota:
+  platform: esphome
+
+# Used to stamp the "report time" field (bytes 76-83) in the fake test
+# payload. Synced from Home Assistant so it doesn't need internet/NTP access.
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# -----------------------------------------------------------------------
+# 16x2 character LCD (HD44780-compatible via a PCF8574 I2C backpack -
+# by far the most common wiring for this size of display; only 2 signal
+# wires needed instead of 6-10 for direct/parallel wiring).
+#
+# Board note: this targets an ESP32-S3 board that only exposes 5V, GND,
+# and pins 1-13. GPIO4/GPIO5 were picked because on the ESP32-S3 chip
+# itself (regardless of which specific small board this is), the only
+# pins with a real boot/strapping role are GPIO0, GPIO3, GPIO45, GPIO46 -
+# GPIO4 and GPIO5 carry no such role on any ESP32-S3 board, and they're
+# physically adjacent for easy wiring.
+#
+# Other assumption: backpack I2C address 0x27 (the other very common
+# default is 0x3F - if the screen stays blank, that's the first thing to
+# try swapping).
+# -----------------------------------------------------------------------
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+
+globals:
+  - id: scroll_pos
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+display:
+  - platform: lcd_pcf8574
+    id: spintouch_lcd
+    dimensions: 16x2
+    address: 0x27
+    update_interval: 250ms
+    lambda: |-
+      // Row 0: scrolling ticker of every value that's actually part of the
+      // current disk/sanitizer selection - same inclusion logic as
+      // run_test_script, so what you see here matches what the next
+      // "Run Test" would actually broadcast.
+      std::string disk = id(disk_select).current_option();
+      std::string sanitizer = id(sanitizer_select).current_option();
+      bool has_iron = (disk == "203" || disk == "303");
+      bool use_borate = (disk == "303" || disk == "304");
+
+      char numbuf[8];
+      auto fmt = [&](float v, int decimals) -> std::string {
+        snprintf(numbuf, sizeof(numbuf), "%.*f", decimals, v);
+        return std::string(numbuf);
+      };
+
+      std::string ticker;
+      if (sanitizer == "Bromine") {
+        ticker += "Br " + fmt(id(n_br).state, 2) + "  ";
+      } else {
+        ticker += "FC " + fmt(id(n_fc).state, 2) + "  ";
+        ticker += "TC " + fmt(id(n_tc).state, 2) + "  ";
+      }
+      ticker += "pH " + fmt(id(n_ph).state, 2) + "  ";
+      ticker += "Alk " + fmt(id(n_alk).state, 1) + "  ";
+      ticker += "Ca " + fmt(id(n_ca).state, 1) + "  ";
+      ticker += "CYA " + fmt(id(n_cya).state, 1) + "  ";
+      ticker += "Cu " + fmt(id(n_cu).state, 2) + "  ";
+      if (has_iron) {
+        ticker += "Fe " + fmt(id(n_fe).state, 2) + "  ";
+      }
+      if (use_borate) {
+        ticker += "Bor " + fmt(id(n_bor).state, 1) + "  ";
+      } else {
+        ticker += "Phos " + fmt(id(n_phos).state, 0) + "  ";
+      }
+      ticker += "Salt " + fmt(id(n_salt).state, 0) + "  ";
+
+      size_t core_len = ticker.size();
+      if (core_len == 0) {
+        return;
+      }
+
+      // Duplicate so the 16-char window can read seamlessly past the end
+      // back to the start, instead of jumping/blanking on wraparound.
+      std::string doubled = ticker + ticker;
+
+      if (id(scroll_pos) >= (int) core_len) {
+        id(scroll_pos) = 0;
+      }
+      std::string window = doubled.substr(id(scroll_pos), 16);
+      it.print(0, 0, window.c_str());
+
+      // Row 1: static status line - which disk/sanitizer this all came from
+      std::string status = "D" + disk + " " + sanitizer;
+      status.resize(16, ' ');
+      it.print(0, 1, status.c_str());
+
+      id(scroll_pos) = id(scroll_pos) + 1;
+
+# -----------------------------------------------------------------------
+# Controls: choose a disk series, choose a sanitizer, dial in each chemical
+# value, then press "Run Test" to generate one fake report.
+# -----------------------------------------------------------------------
+
+select:
+  - platform: template
+    name: "Disk Series"
+    id: disk_select
+    optimistic: true
+    options:
+      - "203"
+      - "204"
+      - "303"
+      - "304"
+    initial_option: "303"
+
+  - platform: template
+    name: "Sanitizer"
+    id: sanitizer_select
+    optimistic: true
+    options:
+      - "Chlorine"
+      - "Bromine"
+      - "Salt"
+    initial_option: "Chlorine"
+
+number:
+  # step is set explicitly on every entry below: ESPHome's template number
+  # platform requires it (it is a Required field, not optional), so this is
+  # the "specific reason" exception to the usual min/max-only default -
+  # without it these chemistry values would only be adjustable in whole
+  # integers, which is not usable for pH, chlorine, etc.
+  - platform: template
+    name: "Free Chlorine"
+    id: n_fc
+    optimistic: true
+    min_value: 0
+    max_value: 15
+    step: 0.01
+
+  - platform: template
+    name: "Total Chlorine"
+    id: n_tc
+    optimistic: true
+    min_value: 0
+    max_value: 15
+    step: 0.01
+
+  - platform: template
+    name: "Bromine"
+    id: n_br
+    optimistic: true
+    min_value: 0
+    max_value: 33
+    step: 0.01
+
+  - platform: template
+    name: "pH"
+    id: n_ph
+    optimistic: true
+    min_value: 6.0
+    max_value: 9.0
+    step: 0.01
+
+  - platform: template
+    name: "Total Alkalinity"
+    id: n_alk
+    optimistic: true
+    min_value: 0
+    max_value: 250
+    step: 1
+
+  - platform: template
+    name: "Calcium Hardness"
+    id: n_ca
+    optimistic: true
+    min_value: 0
+    max_value: 1200
+    step: 1
+
+  - platform: template
+    name: "Cyanuric Acid"
+    id: n_cya
+    optimistic: true
+    min_value: 0
+    max_value: 300
+    step: 1
+
+  - platform: template
+    name: "Copper"
+    id: n_cu
+    optimistic: true
+    min_value: 0
+    max_value: 5
+    step: 0.01
+
+  - platform: template
+    name: "Iron"
+    id: n_fe
+    optimistic: true
+    min_value: 0
+    max_value: 5
+    step: 0.01
+
+  - platform: template
+    name: "Borate"
+    id: n_bor
+    optimistic: true
+    min_value: 0
+    max_value: 100
+    step: 0.1
+
+  - platform: template
+    name: "Phosphate"
+    id: n_phos
+    optimistic: true
+    min_value: 0
+    max_value: 2500
+    step: 1
+
+  - platform: template
+    name: "Salt"
+    id: n_salt
+    optimistic: true
+    min_value: 0
+    max_value: 10000
+    step: 1
+
+button:
+  - platform: template
+    name: "Run Test"
+    on_press:
+      - script.execute: run_test_script
+
+script:
+  - id: run_test_script
+    mode: single
+    then:
+      - lambda: |-
+          ESP_LOGI("spintouch_emu", "Run Test pressed (disk=%s, sanitizer=%s)",
+                   id(disk_select).current_option(), id(sanitizer_select).current_option());
+
+      # Status 0x03 = "Testing in progress" (RESEARCH.md Status Notifications
+      # table). Set but deliberately NOT notified: coordinator.py's
+      # _on_status_notification fires a TTEST read on ANY notification,
+      # regardless of the status byte's value, so notifying here would make
+      # HA try to read the payload before it exists yet.
+      - ble_server.characteristic.set_value:
+          id: testavail_char
+          value: [0x03]
+
+      # Simulate the few seconds the real device takes to read the cuvette
+      - delay: 3s
+
+      # Build and set the 91-byte TTEST payload. Entirely self-contained in
+      # this one lambda per Coding 101 - nothing about the byte layout lives
+      # anywhere else, so there is one place to audit against RESEARCH.md.
+      - ble_server.characteristic.set_value:
+          id: ttest_char
+          value:
+            data: !lambda |-
+              // ---- helper: append one 6-byte [param_id][decimals][float32_le] entry ----
+              auto append_entry = [](std::vector<uint8_t> &buf, uint8_t param_id,
+                                      uint8_t decimals, float value) {
+                buf.push_back(param_id);
+                buf.push_back(decimals);
+                uint8_t raw[4];
+                memcpy(raw, &value, 4);  // ESP32 is little-endian: matches float32_le directly
+                buf.insert(buf.end(), raw, raw + 4);
+              };
+
+              std::string disk = id(disk_select).current_option();
+              std::string sanitizer = id(sanitizer_select).current_option();
+
+              // ---- decide which param_ids this disk/sanitizer combo includes ----
+              // Chemical set per disk series, from README.md "Supported Equipment"
+              // and RESEARCH.md "Disk Series Summary":
+              //   203: FC/TC or Br, pH, Alk, Ca(0x0F std), CYA, Cu, Fe, Salt, Phosphate(0x0E)
+              //   303: FC/TC or Br, pH, Alk, Ca(0x0F std), CYA, Cu, Fe, Salt, Borate(0x0D)
+              //   204: FC/TC or Br, pH, Alk, Ca(0x08 high), CYA, Cu,      Salt, Phosphate(0x0E)
+              //   304: FC/TC or Br, pH, Alk, Ca(0x08 high), CYA, Cu,      Salt, Borate(0x0D)
+              bool has_iron = (disk == "203" || disk == "303");
+              bool high_range_ca = (disk == "204" || disk == "304");
+              bool use_borate = (disk == "303" || disk == "304");   // else phosphate
+
+              std::vector<uint8_t> entries;  // will be zero-padded to 12 * 6 = 72 bytes
+
+              // Sanitizer: Chlorine and Salt both report FC/TC (0x01/0x02);
+              // Bromine reports BR (0x03) instead. Only the metadata
+              // sanitizer-type byte differs between Chlorine and Salt.
+              if (sanitizer == "Bromine") {
+                append_entry(entries, 0x03, 2, id(n_br).state);          // Bromine
+              } else {
+                append_entry(entries, 0x01, 2, id(n_fc).state);          // Free Chlorine
+                append_entry(entries, 0x02, 2, id(n_tc).state);          // Total Chlorine
+              }
+
+              append_entry(entries, 0x06, 2, id(n_ph).state);            // pH
+              append_entry(entries, 0x07, 1, id(n_alk).state);           // Total Alkalinity
+              append_entry(entries, high_range_ca ? 0x08 : 0x0F, 1,
+                           id(n_ca).state);                               // Calcium Hardness
+              append_entry(entries, 0x0A, 1, id(n_cya).state);           // Cyanuric Acid
+              append_entry(entries, 0x0C, 2, id(n_cu).state);            // Copper
+
+              if (has_iron) {
+                append_entry(entries, 0x0B, 2, id(n_fe).state);          // Iron
+              }
+
+              if (use_borate) {
+                append_entry(entries, 0x0D, 1, id(n_bor).state);         // Borate
+              } else {
+                append_entry(entries, 0x0E, 0, id(n_phos).state);        // Phosphate
+              }
+
+              append_entry(entries, 0x10, 0, id(n_salt).state);          // Salt
+
+              uint8_t num_valid_results = entries.size() / 6;
+
+              // Zero-pad remaining entry slots up to 12 total (72 bytes),
+              // matching the trailing zero padding seen in real captures.
+              entries.resize(72, 0x00);
+
+              // ---- timestamp: bytes 76-83, YY-MM-DD-HH-MM-SS-AMPM-Military ----
+              auto now = id(ha_time).now();
+              uint8_t yy = static_cast<uint8_t>(now.year - 2000);
+              uint8_t mm = now.month;
+              uint8_t dd = now.day_of_month;
+              uint8_t hh = now.hour;      // 24h value
+              uint8_t mi = now.minute;
+              uint8_t ss = now.second;
+              uint8_t ampm = 0;           // unused when military = 1
+              uint8_t military = 1;       // tell the parser hour is already 24h
+
+              // ---- metadata: bytes 84-86 ----
+              // disk_type index, from DISK_TYPE_MAP in const.py
+              uint8_t disk_type_index = 0;
+              if (disk == "203") disk_type_index = 17;
+              else if (disk == "303") disk_type_index = 18;
+              else if (disk == "204") disk_type_index = 23;
+              else if (disk == "304") disk_type_index = 24;
+
+              // sanitizer_type index, from SANITIZER_TYPE_MAP in const.py
+              uint8_t sanitizer_type_index = 0;       // 0 = Chlorine
+              if (sanitizer == "Salt") sanitizer_type_index = 1;
+              else if (sanitizer == "Bromine") sanitizer_type_index = 2;
+
+              // ---- assemble full 91-byte payload ----
+              std::vector<uint8_t> payload;
+              payload.reserve(91);
+
+              // [0-3] start signature
+              payload.insert(payload.end(), {0x01, 0x02, 0x03, 0x05});
+
+              // [4-75] 12 entries x 6 bytes
+              payload.insert(payload.end(), entries.begin(), entries.end());
+
+              // [76-83] timestamp
+              payload.insert(payload.end(), {yy, mm, dd, hh, mi, ss, ampm, military});
+
+              // [84-86] metadata
+              payload.insert(payload.end(), {num_valid_results, disk_type_index, sanitizer_type_index});
+
+              // [87-90] end signature
+              payload.insert(payload.end(), {0x07, 0x0B, 0x0D, 0x11});
+
+              return payload;
+
+      # Status 0x04 = "Test complete" - triggers HA's TESTAVAIL notify handler,
+      # which reads TTEST and writes the ACK.
+      - ble_server.characteristic.set_value:
+          id: testavail_char
+          value: [0x04]
+      - ble_server.characteristic.notify:
+          id: testavail_char
+
+# -----------------------------------------------------------------------
+# BLE GATT server: reproduces the SpinTouch service exactly.
+# UUIDs copied verbatim from custom_components/spintouch/const.py.
+# -----------------------------------------------------------------------
+esp32_ble_server:
+  manufacturer: "LaMotte"
+  model: "SpinTouch Emulator"
+  services:
+    - uuid: 00000000-0000-1000-8000-bbbd00000000   # SPIN_TOUCH_SERVICE
+      advertise: true                              # <- this is what HA's bluetooth
+                                                     #    matcher on service_uuid finds
+      characteristics:
+        # SPIN_TOUCH_TTEST - main 91-byte test result payload
+        - id: ttest_char
+          uuid: 00000000-0000-1000-8000-bbbd00000010
+          read: true
+          # No static/templated value here on purpose: leaving this unset
+          # means ble_server.characteristic.set_value (in run_test_script)
+          # is allowed to write a static snapshot, and repeated reads keep
+          # returning that same snapshot until the next test - exactly like
+          # the real device, and required for HA's duplicate-timestamp
+          # de-dupe logic in coordinator.py to behave correctly.
+
+        # SPIN_TOUCH_TESTAVAIL - single-byte status, notify-driven
+        - id: testavail_char
+          uuid: 00000000-0000-1000-8000-bbbd00000011
+          read: true
+          notify: true
+          value: [0x02]   # 0x02 = Ready, per RESEARCH.md Status Notifications table
+
+        # SPIN_TOUCH_SENDTEST - real protocol allows write here; our emulator
+        # doesn't act on it (the HA integration doesn't write to it either),
+        # just logs so nothing is silently dropped.
+        - id: sendtest_char
+          uuid: 00000000-0000-1000-8000-bbbd00000012
+          read: true
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  ESP_LOGD("spintouch_emu", "SENDTEST write from client %d: %s",
+                           id, format_hex_pretty(x.data(), x.size()).c_str());
+
+        # SPIN_TOUCH_TESTACK - HA writes 0x01 here after a successful read
+        - id: testack_char
+          uuid: 00000000-0000-1000-8000-bbbd00000013
+          read: true
+          write: true
+          on_write:
+            then:
+              - lambda: |-
+                  ESP_LOGI("spintouch_emu", "ACK received from client %d: %s",
+                           id, format_hex_pretty(x.data(), x.size()).c_str());
+              # Back to "Ready" now that the test has been collected
+              - ble_server.characteristic.set_value:
+                  id: testavail_char
+                  value: [0x02]
+
+        # Device Info - static, copied verbatim from a real capture in
+        # RESEARCH.md ("Device Info Data Format" section). Not used by the
+        # HA integration today, included for protocol completeness.
+        - id: device_info_char
+          uuid: 00000000-0000-1000-8000-bbbd00000031
+          read: true
+          value: [0xBD, 0x0B, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x01,
+                   0x3A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
