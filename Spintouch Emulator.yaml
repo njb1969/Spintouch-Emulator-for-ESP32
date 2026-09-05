@@ -103,6 +103,10 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
+  - id: client_connected
+    type: bool
+    restore_value: false
+    initial_value: 'false'
 
 display:
   - platform: lcd_pcf8574
@@ -447,12 +451,50 @@ script:
           id: testavail_char
 
 # -----------------------------------------------------------------------
+# Optional: keep refreshing the test result periodically while a client is
+# connected (e.g. useful if you build your own reader that stays connected
+# continuously, rather than HA's connect/read/disconnect-for-5-min pattern).
+# Gated on our own client_connected flag (set/cleared by on_connect/
+# on_disconnect above) so this never fires into a void - skips silently if
+# nobody's currently connected to receive the notify.
+# Adjust "60s" to whatever refresh rate suits what you're testing.
+# -----------------------------------------------------------------------
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(client_connected);'
+          then:
+            - script.execute: run_test_script
+
+# -----------------------------------------------------------------------
 # BLE GATT server: reproduces the SpinTouch service exactly.
 # UUIDs copied verbatim from custom_components/spintouch/const.py.
 # -----------------------------------------------------------------------
 esp32_ble_server:
+  id: ble_server
   manufacturer: "LaMotte"
   model: "SpinTouch Emulator"
+  # Autonomous operation: run a test automatically whenever a client connects,
+  # rather than on a fixed timer that's blind to whether anyone's listening.
+  # This matters because the REAL HA integration (coordinator.py) disconnects
+  # ~10s after reading a result and deliberately stays disconnected for 5
+  # minutes before reconnecting (to let a real LaMotte phone app get exclusive
+  # access) - a notify sent during that 5-minute gap reaches no one, since
+  # there's no subscribed client to receive it. Triggering on_connect instead
+  # re-syncs to whatever cadence the connected reader actually uses.
+  # The 2s delay gives the client time to finish subscribing to notifications
+  # (bleak's start_notify) before we send one - notifying too early, before
+  # the CCCD subscription is registered, would be silently dropped.
+  on_connect:
+    then:
+      - lambda: 'id(client_connected) = true;'
+      - delay: 2s
+      - script.execute: run_test_script
+  on_disconnect:
+    then:
+      - lambda: 'id(client_connected) = false;'
   services:
     - uuid: 00000000-0000-1000-8000-bbbd00000000   # SPIN_TOUCH_SERVICE
       advertise: true                              # <- this is what HA's bluetooth
