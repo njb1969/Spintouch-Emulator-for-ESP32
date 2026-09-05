@@ -32,28 +32,14 @@
 esphome:
   name: spintouch-emulator
   friendly_name: SpinTouch Emulator
-  # Randomize every chemical value once per boot. random_float() is backed
-  # by the ESP32's hardware RNG (esp_random()), so this differs on every
-  # boot without needing a seed. Disk series and sanitizer are left as
-  # whatever the user last selected - only the chemical numbers randomize.
+  # Full autonomous operation: run the complete randomize + broadcast
+  # sequence once at boot too, exactly like on_connect and the periodic
+  # interval do. No values need to be pre-set here - run_test_script's own
+  # first step handles all the randomization now (Option B: disk, sanitizer,
+  # and every chemical value all rotate together on every test run).
   on_boot:
     then:
-      - lambda: |-
-          auto rand_range = [](float lo, float hi) -> float {
-            return lo + random_float() * (hi - lo);
-          };
-          id(n_fc).publish_state(rand_range(0, 15));
-          id(n_tc).publish_state(rand_range(0, 15));
-          id(n_br).publish_state(rand_range(0, 33));
-          id(n_ph).publish_state(rand_range(6.0, 9.0));
-          id(n_alk).publish_state(rand_range(0, 250));
-          id(n_ca).publish_state(rand_range(0, 1200));
-          id(n_cya).publish_state(rand_range(0, 300));
-          id(n_cu).publish_state(rand_range(0, 5));
-          id(n_fe).publish_state(rand_range(0, 5));
-          id(n_bor).publish_state(rand_range(0, 100));
-          id(n_phos).publish_state(rand_range(0, 2500));
-          id(n_salt).publish_state(rand_range(0, 10000));
+      - script.execute: run_test_script
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -313,6 +299,40 @@ script:
   - id: run_test_script
     mode: single
     then:
+      # Randomize every chemical value AND rotate Disk Series/Sanitizer for
+      # this test run. Single source of truth for randomization: this same
+      # script runs on boot, on_connect, and the periodic interval, so every
+      # trigger gets a fresh, independent combination - no manual interface
+      # needed to see different parameter sets over time.
+      - lambda: |-
+          auto rand_range = [](float lo, float hi) -> float {
+            return lo + random_float() * (hi - lo);
+          };
+          id(n_fc).publish_state(rand_range(0, 15));
+          id(n_tc).publish_state(rand_range(0, 15));
+          id(n_br).publish_state(rand_range(0, 33));
+          id(n_ph).publish_state(rand_range(6.0, 9.0));
+          id(n_alk).publish_state(rand_range(0, 250));
+          id(n_ca).publish_state(rand_range(0, 1200));
+          id(n_cya).publish_state(rand_range(0, 300));
+          id(n_cu).publish_state(rand_range(0, 5));
+          id(n_fe).publish_state(rand_range(0, 5));
+          id(n_bor).publish_state(rand_range(0, 100));
+          id(n_phos).publish_state(rand_range(0, 2500));
+          id(n_salt).publish_state(rand_range(0, 10000));
+
+          // Option B: also randomly rotate Disk Series and Sanitizer, so
+          // every parameter combination (Bromine, Phosphate, high-range
+          // Calcium, etc.) gets exercised over time with no manual input.
+          const char *disks[] = {"203", "204", "303", "304"};
+          const char *sanitizers[] = {"Chlorine", "Bromine", "Salt"};
+          int disk_idx = (int) (random_float() * 4);
+          if (disk_idx > 3) disk_idx = 3;  // guard the rare float rounding to 4.0
+          int san_idx = (int) (random_float() * 3);
+          if (san_idx > 2) san_idx = 2;    // same guard for 3.0
+          id(disk_select).publish_state(disks[disk_idx]);
+          id(sanitizer_select).publish_state(sanitizers[san_idx]);
+
       - lambda: |-
           ESP_LOGI("spintouch_emu", "Run Test pressed (disk=%s, sanitizer=%s)",
                    id(disk_select).current_option().c_str(), id(sanitizer_select).current_option().c_str());
