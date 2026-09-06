@@ -32,14 +32,8 @@
 esphome:
   name: spintouch-emulator
   friendly_name: SpinTouch Emulator
-  # Full autonomous operation: run the complete randomize + broadcast
-  # sequence once at boot too, exactly like on_connect and the periodic
-  # interval do. No values need to be pre-set here - run_test_script's own
-  # first step handles all the randomization now (Option B: disk, sanitizer,
-  # and every chemical value all rotate together on every test run).
-  on_boot:
-    then:
-      - script.execute: run_test_script
+  # NOTE: deliberately no on_boot trigger here anymore. See the interval:
+  # block below for why, and how the boot-time test still runs automatically.
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -117,6 +111,12 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
+  # See the interval: block below - tracks whether the boot-time test has
+  # run yet, so the polling check there only ever fires it once.
+  - id: boot_test_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
 
 display:
   - platform: lcd_pcf8574
@@ -524,7 +524,39 @@ script:
 # nobody's currently connected to receive the notify.
 # Adjust "60s" to whatever refresh rate suits what you're testing.
 # -----------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# Runs the boot-time test once BLE is actually ready, plus the periodic
+# refresh while a client is connected.
+#
+# Why this replaced a plain on_boot trigger: esp32_ble_server's readiness
+# isn't synchronous with setup() - BLEServer::is_running() only becomes
+# true after an internal state machine (RUNNING -> STARTING_SERVICE ->
+# RUNNING) finishes across several loop() ticks. A script firing at raw
+# on_boot time can run before that finishes, and calling
+# ble_server.characteristic.set_value on a characteristic that isn't
+# registered with the BT stack yet crashes the device - confirmed directly
+# from a real device log showing a boot loop (repeated "Unsuccessful boot
+# attempts" and a reset immediately after "Run Test pressed", every time,
+# before "BLE server setup successfully" ever appeared).
+#
+# wait_until: inside on_boot was considered and deliberately avoided: there
+# is a documented ESPHome bug where wait_until can hang specifically inside
+# on_boot automations (fixed in esphome#11869, but not confirmed which
+# side of that fix this project's ESPHome version falls on). Polling via a
+# short interval, gated by a one-shot flag, uses the exact same
+# interval/if/lambda pattern already proven working elsewhere in this file
+# (the 60s refresh below), so it carries no similar unverified risk.
+# -----------------------------------------------------------------------
 interval:
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(boot_test_done) && id(ble_server).is_running();'
+          then:
+            - lambda: 'id(boot_test_done) = true;'
+            - script.execute: run_test_script
+
   - interval: 60s
     then:
       - if:
