@@ -1,5 +1,10 @@
 # SpinTouch BLE Emulator
 
+> **Built entirely on top of the reverse-engineering work in
+> [joyfulhouse/lamotte-spintouch](https://github.com/joyfulhouse/lamotte-spintouch)**
+> — see [Acknowledgements](#acknowledgements--this-project-would-not-exist-without-this-work)
+> below for full credit.
+
 An ESPHome firmware project that turns an ESP32-S3 into a fake **LaMotte
 WaterLink SpinTouch** pool/spa water tester — a real, physical Bluetooth
 device that reads chemical values (chlorine, pH, alkalinity, etc.) off a
@@ -16,6 +21,33 @@ generates a random test result — random disk type, random sanitizer,
 random values for every chemical — and keeps generating fresh results
 automatically from then on, with no button presses, no dashboard, and no
 manual input required.
+
+---
+
+## Acknowledgements — this project would not exist without this work
+
+**None of the protocol knowledge in this repository originated here.**
+Every BLE UUID, every byte offset, the entire 91-byte payload structure,
+the disk-series parameter tables, and the connection lifecycle this
+emulator reproduces were reverse-engineered — by decompiling the
+official LaMotte Android app and capturing real BLE traffic — entirely
+by the author(s) of
+**[joyfulhouse/lamotte-spintouch](https://github.com/joyfulhouse/lamotte-spintouch)**,
+documented in that repository's `RESEARCH.md`. This project is a
+downstream consumer of that work, not an independent discovery of the
+protocol. Full credit for the actual hard part — figuring out what the
+device does at all — belongs there.
+
+Per that repository's own `LICENSE` and `.github/CODEOWNERS`:
+
+- Copyright (c) 2024–2026 **JoyfulHouse Real Estate LLC**
+- Maintained by **[@btli](https://github.com/btli)**
+
+If this emulator has been useful to you, please consider supporting the
+original work directly, via the links in their README:
+
+- [GitHub Sponsors](https://github.com/sponsors/btli)
+- [Ko-fi](https://ko-fi.com/bryanli)
 
 ---
 
@@ -328,4 +360,5 @@ range and all disk/sanitizer combinations appear with even distribution.
 Not affiliated with or endorsed by LaMotte. Built against the publicly
 documented, reverse-engineered protocol in
 [joyfulhouse/lamotte-spintouch](https://github.com/joyfulhouse/lamotte-spintouch)
-for interoperability testing purposes.
+for interoperability testing purposes — see **Acknowledgements** above
+for full credit for that underlying work.
