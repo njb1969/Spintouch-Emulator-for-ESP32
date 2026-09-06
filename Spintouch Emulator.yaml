@@ -58,8 +58,16 @@ api:
 ota:
   platform: esphome
 
-# Used to stamp the "report time" field (bytes 76-83) in the fake test
-# payload. Synced from Home Assistant so it doesn't need internet/NTP access.
+# Used to stamp the "report time" field (bytes 76-83) when available.
+# Synced from Home Assistant so it doesn't need internet/NTP access.
+#
+# Graceful fallback: if WiFi never connects, id(ha_time).now() never
+# receives a real sync, and ESPHome's own ESPTime::is_valid() correctly
+# reports that (it checks all fields are in range AND year > ~2018 - an
+# unsynced clock reads as 1970, which fails that check). run_test_script
+# checks is_valid() itself and falls back to a fully local synthetic clock
+# when it's false, so the device still produces valid, always-different
+# timestamps with no network at all - see the timestamp section below.
 time:
   - platform: homeassistant
     id: ha_time
@@ -79,6 +87,14 @@ time:
 # Other assumption: backpack I2C address 0x27 (the other very common
 # default is 0x3F - if the screen stays blank, that's the first thing to
 # try swapping).
+#
+# Optional hardware: if the LCD isn't physically connected, ESPHome's own
+# component model already handles this gracefully with no code needed -
+# the I2C bus scan finds nothing, lcd_pcf8574's setup() fails, ESPHome
+# marks the display component failed, and simply stops calling its update
+# logic from then on. Nothing else in this file is affected - confirmed
+# directly from a real device log with no LCD attached: WiFi, BLE, and
+# every other component kept initializing normally regardless.
 # -----------------------------------------------------------------------
 i2c:
   sda: GPIO4
@@ -93,6 +109,14 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  # Drives the synthetic clock fallback used when id(ha_time) has never
+  # synced (no WiFi). Advances by a simulated 60 "seconds" every test run,
+  # so timestamps are always valid and always different from the previous
+  # test even with zero network access.
+  - id: test_counter
+    type: int
+    restore_value: false
+    initial_value: '0'
 
 display:
   - platform: lcd_pcf8574
@@ -418,13 +442,34 @@ script:
               entries.resize(72, 0x00);
 
               // ---- timestamp: bytes 76-83, YY-MM-DD-HH-MM-SS-AMPM-Military ----
+              // Use real synced time when available; fall back to a fully
+              // local synthetic clock when it isn't (no WiFi, or HA hasn't
+              // synced yet). is_valid() is ESPHome's own check for exactly
+              // this - it fails whenever the clock is still at its default
+              // unsynced 1970 reading.
+              uint8_t yy, mm, dd, hh, mi, ss;
               auto now = id(ha_time).now();
-              uint8_t yy = static_cast<uint8_t>(now.year - 2000);
-              uint8_t mm = now.month;
-              uint8_t dd = now.day_of_month;
-              uint8_t hh = now.hour;      // 24h value
-              uint8_t mi = now.minute;
-              uint8_t ss = now.second;
+              if (now.is_valid()) {
+                yy = static_cast<uint8_t>(now.year - 2000);
+                mm = now.month;
+                dd = now.day_of_month;
+                hh = now.hour;      // 24h value
+                mi = now.minute;
+                ss = now.second;
+              } else {
+                // Synthetic fallback - doesn't need to be a real calendar
+                // date, only valid per-field and different from the
+                // previous test. Day kept in 1-28 and month in 1-12
+                // deliberately, to avoid needing real calendar math.
+                int n = id(test_counter);
+                ss = n % 60;
+                mi = (n / 60) % 60;
+                hh = (n / 3600) % 24;
+                dd = 1 + (n / 86400) % 28;
+                mm = 1 + (n / (86400 * 28)) % 12;
+                yy = 26 + (n / (86400 * 28 * 12));  // 2026 + ...
+                id(test_counter) = n + 60;
+              }
               uint8_t ampm = 0;           // unused when military = 1
               uint8_t military = 1;       // tell the parser hour is already 24h
 
